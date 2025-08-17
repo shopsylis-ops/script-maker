@@ -1,14 +1,14 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import os, json, re
+import os, json, re, io, csv
 import google.generativeai as genai
 
 app = FastAPI()
 
-# --- CORS (tests depuis navigateur / Hoppscotch/Postman) ---
+# CORS (tests depuis navigateur / Hoppscotch)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tu peux restreindre à une URL précise si tu veux
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -21,7 +21,7 @@ MODEL_NAME = "gemini-1.5-flash"
 # --- Guide "experts" + règles par style (FR OBLIGATOIRE) + VISUEL + CTA ---
 STRUCTURE_GUIDE = r"""
 Tu es un comité de 6 experts (neurosciences, scénariste TikTok, growth, montage, analyste data, éthique).
-TA RÉPONSE DOIT ÊTRE EXCLUSIVEMENT EN FRANÇAIS et en JSON VALIDE (UTF-8), sans texte autour.
+TA RÉPONSE DOIT ÊTRE EXCLUSIVEMENT EN **FRANÇAIS** et en **JSON VALIDE** (UTF-8), sans texte autour.
 
 Schéma JSON attendu :
 {
@@ -55,7 +55,7 @@ RÈGLES COMMUNES :
 - Chaque 'point' contient un 'example' réel/plausible et un 'broll' concret.
 - ≥ 1 'micro_action' réalisable en <10 s.
 - 'proof' cite 1 source courte si utile : Auteur/Revue/Année (ex: "Tversky & Kahneman, Science, 1974").
-- CTA OBLIGATOIRE : 'cta.text' demande explicitement un like ET de s'abonner/suivre la chaîne.
+- **CTA OBLIGATOIRE** : 'cta.text' doit demander explicitement un **like** ET de **s'abonner/suivre la chaîne**.
 - 'caption' ≤ 8 mots.
 - 'risk_flags' si promesse exagérée, source floue, vocabulaire médical excessif.
 - Si conseil santé : 'disclaimer' court ("Ne remplace pas un avis professionnel").
@@ -66,7 +66,7 @@ SPÉCIFICITÉS PAR STYLE :
 - docu : ton sérieux, visuels ciné (fond sombre, plans serrés), 'proof' OBLIGATOIRE, captions sobres.
 - viral : rythme rapide, ≥ 1 "pattern_interrupt" par beat, ≥ 1 "micro_action" < 10 s.
 - quiz :
-   - hook = QUESTION + 3 options A/B/C dans le même champ 'text',
+   - hook = QUESTION + 3 options **A/B/C** dans le même champ 'text',
    - point(5-15) = révélation de la bonne réponse,
    - point(15-30) = fun fact + mini explication,
    - proof facultatif,
@@ -75,7 +75,7 @@ SPÉCIFICITÉS PAR STYLE :
 NE JAMAIS SORTIR DU FORMAT JSON.
 """
 
-# ----------------- Utils Gemini & JSON -----------------
+# ----------------- Gemini helpers -----------------
 def ask_gemini(prompt: str) -> str:
     model = genai.GenerativeModel(MODEL_NAME)
     resp = model.generate_content(prompt)
@@ -93,7 +93,6 @@ def force_json(txt: str):
 
 # ----------------- Normalisation / garanties -----------------
 def ensure_cta_like_follow(section):
-    """Corrige le CTA pour exiger 'like' et 'abonne/suis' en FR."""
     if not section or section.get("type") != "cta":
         return {
             "type":"cta","time":"40-45",
@@ -116,13 +115,11 @@ def default_visual_style(style: str):
         return {"luminosity":"clair","contrast":"moyen","color_palette":"saturées",
                 "transitions":["cut sec","zoom rapide"],"effects":["texte animé","glitch léger"],
                 "overall_style":"pop colorée"}
-    # quiz
     return {"luminosity":"neutre","contrast":"moyen","color_palette":"neutres",
             "transitions":["cut sec","pop-in réponses"],"effects":["texte animé","split screen"],
             "overall_style":"sobre éducatif"}
 
 def suggest_hashtags(topic: str, style: str):
-    """Hashtags FR/EN pertinents TikTok/Shorts/Reels (max ~8)."""
     base = ["#psychologie", "#cerveau", "#science", "#neurosciences", "#apprendre", "#fyp", "#pourtoi"]
     if style == "viral":
         extra = ["#viral", "#shorts", "#tiktokfr", "#buzz"]
@@ -131,38 +128,32 @@ def suggest_hashtags(topic: str, style: str):
     else:
         extra = ["#quiz", "#jeu", "#challenge", "#test"]
     topic_tag = "#" + re.sub(r"[^a-z0-9]", "", topic.lower())
-    tags = base + extra + [topic_tag]
     seen, out = set(), []
-    for t in tags:
+    for t in base + extra + [topic_tag]:
         if t not in seen and t:
             out.append(t); seen.add(t)
     return out[:8]
 
 def normalize_sections(data, style: str, duration: int, topic_for_tags: str):
-    """Assure sections minimales, CTA FR, visual_style, durée bornée, hashtags."""
     secs = data.get("sections", [])
     types = [s.get("type") for s in secs]
 
-    # Hook
     if "hook" not in types:
         secs.insert(0, {"type":"hook","time":"0-5","text":"Ton cerveau te joue des tours.",
                         "caption":"Ton cerveau te trompe","broll":"plan serré visage",
                         "pattern_interrupt":"cut rapide"})
-    # Minimum 2 points
     if types.count("point") < 2:
         secs.append({"type":"point","time":"5-15","text":"Exemple simple et concret.",
                      "caption":"Tu l’as vécu ?","broll":"texte animé","example":"situation quotidienne"})
         secs.append({"type":"point","time":"15-30","text":"Mini action à tester maintenant.",
                      "caption":"Teste-le","broll":"mains + téléphone","micro_action":"essaie pendant 10s"})
-    # Proof
     if "proof" not in types:
         secs.append({"type":"proof","time":"30-40","text":"Observation étayée.","source":"—"})
-    # CTA
+
     cta_idx = next((i for i,s in enumerate(secs) if s.get("type")=="cta"), None)
     secs.append(ensure_cta_like_follow(None)) if cta_idx is None else \
         secs.__setitem__(cta_idx, ensure_cta_like_follow(secs[cta_idx]))
 
-    # Spécifique "quiz"
     if style == "quiz":
         for s in secs:
             if s.get("type") == "hook":
@@ -174,23 +165,91 @@ def normalize_sections(data, style: str, duration: int, topic_for_tags: str):
 
     data["sections"] = secs
 
-    # Visual style
     if "visual_style" not in data or not isinstance(data.get("visual_style"), dict):
         data["visual_style"] = default_visual_style(style)
 
-    # Durée bornée 30–60
     data["duration_sec"] = max(30, min(int(data.get("duration_sec", duration)), 60))
 
-    # Hashtags
     title_or_topic = data.get("title") or topic_for_tags
     data["hashtags"] = suggest_hashtags(title_or_topic, style)
 
-    # Champs complémentaires par défaut
     data.setdefault("disclaimer", "Contenu éducatif. Ne remplace pas un avis professionnel.")
     data.setdefault("risk_flags", [])
     data.setdefault("metrics_hypothesis", ["hook fort", "micro-action <10s", "question commentable"])
     data.setdefault("reuse_assets", True)
     return data
+
+# ----------------- Utils export -----------------
+def _parse_time_range(t: str):
+    """'5-12' -> (00:00:05,000, 00:00:12,000) pour SRT."""
+    try:
+        start_s, end_s = [int(float(x)) for x in re.split(r"[-–]", t.strip())[:2]]
+    except Exception:
+        start_s, end_s = 0, 3
+    def fmt(s):
+        h = s // 3600; m = (s % 3600) // 60; sec = s % 60
+        return f"{h:02}:{m:02}:{sec:02},000"
+    return fmt(start_s), fmt(end_s)
+
+def build_srt(sections):
+    lines, idx = [], 1
+    for s in sections:
+        if "time" not in s: continue
+        start, end = _parse_time_range(s["time"])
+        text = s.get("caption") or s.get("text") or ""
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text: continue
+        lines += [str(idx), f"{start} --> {end}", text, ""]
+        idx += 1
+    return "\n".join(lines).strip() + "\n"
+
+def build_voiceover(sections, title):
+    parts = [f"Titre: {title}", ""]
+    for s in sections:
+        t = s.get("type")
+        if t in ("hook","point","proof","cta"):
+            txt = s.get("text","").strip()
+            if txt:
+                parts.append(txt)
+    parts.append("")
+    parts.append("👉 Si tu as appris un truc, mets un like et abonne-toi à Synaptik Minutes.")
+    return "\n".join(parts).strip() + "\n"
+
+def build_shotlist_csv(sections):
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["time_start","time_end","type","action","broll","notes"])
+    for s in sections:
+        ts = s.get("time","0-0")
+        start, end = _parse_time_range(ts)
+        writer.writerow([
+            start, end, s.get("type",""),
+            s.get("caption","") or s.get("text","")[:60],
+            s.get("broll",""),
+            s.get("pattern_interrupt","") or s.get("micro_action","")
+        ])
+    return buf.getvalue()
+
+def build_storyboard_md(script):
+    s = script
+    lines = [f"# {s.get('title','Storyboard')}", ""]
+    vs = s.get("visual_style", {})
+    if vs:
+        lines += ["**Style visuel** :",
+                  f"- Luminosité : {vs.get('luminosity','')}",
+                  f"- Contraste : {vs.get('contrast','')}",
+                  f"- Palette : {vs.get('color_palette','')}",
+                  f"- Transitions : {', '.join(vs.get('transitions',[]))}",
+                  f"- Effets : {', '.join(vs.get('effects',[]))}",
+                  f"- Global : {vs.get('overall_style','')}", ""]
+    for sec in s.get("sections", []):
+        lines += [f"## {sec.get('type','').upper()}  ({sec.get('time','')})",
+                  f"- **Texte** : {sec.get('text','')}",
+                  f"- **Caption** : {sec.get('caption','')}",
+                  f"- **B-roll** : {sec.get('broll','')}",
+                  f"- **Notes** : {sec.get('pattern_interrupt','') or sec.get('micro_action','')}", ""]
+    lines += ["---", f"Hashtags : {' '.join(s.get('hashtags', []))}"]
+    return "\n".join(lines).strip() + "\n"
 
 # ----------------- ROUTES -----------------
 @app.get("/")
@@ -218,11 +277,9 @@ RENVOIE UNIQUEMENT LE JSON.
 """
     raw = ask_gemini(prompt)
 
-    # Parsing + normalisation
     try:
         data = force_json(raw)
     except Exception:
-        # Fallback minimal si JSON invalide
         data = {
             "title": f"{topic} ({duration}s)", "style": style, "duration_sec": duration,
             "sections": [
@@ -249,73 +306,94 @@ RENVOIE UNIQUEMENT LE JSON.
         "style": style,
         "duration_sec": data["duration_sec"],
         "script": data,
-        "raw": raw  # utile pour debug
+        "raw": raw
     }
+
+@app.post("/improve")
+async def improve(request: Request):
+    payload = await request.json()
+    script = payload.get("script")
+    if not script:
+        return {"error": "Body must include 'script' (JSON de ton script)"}
+    style = script.get("style", "viral")
+    duration = int(script.get("duration_sec", 45))
+    topic = script.get("title", "psychologie")
+
+    prompt = (
+        "Tu es un comité d'experts qui optimise le script ci-dessous pour maximiser la rétention et l'engagement. "
+        "Renvoie EXCLUSIVEMENT le JSON du script amélioré, en FRANÇAIS, même schéma. "
+        "CTA doit demander like + abonnement. "
+        f"Style: {style}, Durée cible: {duration}s.\n\n"
+        f"Script à améliorer:\n```json\n{json.dumps(script, ensure_ascii=False)}\n```"
+    )
+    raw = ask_gemini(prompt)
+    try:
+        improved = force_json(raw)
+    except Exception:
+        improved = script  # fallback
+
+    improved = normalize_sections(improved, style, duration, topic_for_tags=topic)
+    return {"improved_script": improved, "raw": raw}
 
 @app.post("/lint")
 async def lint(request: Request):
-    """
-    Valide/corrige un script JSON.
-    Retourne: issues (liste) + fixed_script (normalisé).
-    """
     payload = await request.json()
     script = payload.get("script", payload)
     style = script.get("style", "viral")
     duration = int(script.get("duration_sec", 45))
 
     issues = []
-
-    # CTA présent + FR like/abo
     cta = next((s for s in script.get("sections", []) if s.get("type")=="cta"), None)
     if not cta or not re.search(r"like", cta.get("text",""), re.I) or \
        not re.search(r"(abonne|suis|suivre)", cta.get("text",""), re.I):
         issues.append("CTA incomplet : il doit demander like + abonnement (FR).")
 
-    # captions <= 8 mots
     for s in script.get("sections", []):
         cap = s.get("caption","")
         if cap and len(cap.split()) > 8:
             issues.append(f"Caption trop longue: '{cap}'")
 
-    # visual_style complet ?
     if "visual_style" not in script or not isinstance(script.get("visual_style"), dict):
         issues.append("visual_style manquant : luminosity/contrast/palette/transitions/effects/overall_style.")
-
-    # hashtags présents ?
     if "hashtags" not in script or not script.get("hashtags"):
         issues.append("hashtags manquants.")
 
     fixed = normalize_sections(script, style, duration, topic_for_tags=script.get("title","topic"))
     return {"issues": list(set(issues)), "fixed_script": fixed}
 
-@app.post("/improve")
-async def improve(request: Request):
+@app.post("/export")
+async def export_assets(request: Request):
     """
-    Améliore un script existant avec le comité d'experts.
-    Retourne une version optimisée (CTA/captions/micro-actions/style/hashtags).
+    Transforme un script en livrables texte.
+    Body:
+    {
+      "script": {...},
+      "formats": ["storyboard","captions","voiceover","shotlist"]  // optionnel, par défaut tout
+    }
     """
-    body = await request.json()
-    script = body.get("script")
-
+    payload = await request.json()
+    script = payload.get("script")
     if not script:
-        return {"error": "Aucun script fourni. Envoie { \"script\": { ...ton JSON... } }"}
+        return {"error": "Body must include 'script'."}
+    formats = payload.get("formats", ["storyboard","captions","voiceover","shotlist"])
 
-    style = script.get("style", "viral")
+    # Normaliser au cas où
+    style = script.get("style","viral")
     duration = int(script.get("duration_sec", 45))
+    script = normalize_sections(script, style, duration, topic_for_tags=script.get("title","topic"))
 
-    prompt = f"""{STRUCTURE_GUIDE}
+    out = {}
+    if "captions" in formats:
+        out["captions_srt_filename"] = "captions.srt"
+        out["captions_srt"] = build_srt(script.get("sections", []))
+    if "voiceover" in formats:
+        out["voiceover_txt_filename"] = "voiceover.txt"
+        out["voiceover_txt"] = build_voiceover(script.get("sections", []), script.get("title","Voix off"))
+    if "shotlist" in formats:
+        out["shotlist_csv_filename"] = "shotlist.csv"
+        out["shotlist_csv"] = build_shotlist_csv(script.get("sections", []))
+    if "storyboard" in formats:
+        out["storyboard_md_filename"] = "storyboard.md"
+        out["storyboard_md"] = build_storyboard_md(script)
 
-Améliore ce script déjà généré pour le rendre plus percutant, clair et engageant,
-en respectant STRICTEMENT le schéma JSON attendu :
-{json.dumps(script, ensure_ascii=False, indent=2)}
-
-RENVOIE UNIQUEMENT LE JSON.
-"""
-    raw = ask_gemini(prompt)
-    try:
-        data = force_json(raw)
-    except Exception:
-        data = script  # fallback
-
-    data = normalize_sections(data, style, duration, topic_for_tags=script.get("title","topic"))
-    return {"improved_script": data, "raw": raw}
+    return {"exports": out, "meta": {"title": script.get("title"), "style": style, "duration_sec": duration}}
