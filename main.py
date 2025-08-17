@@ -5,10 +5,10 @@ import google.generativeai as genai
 
 app = FastAPI()
 
-# CORS (tests depuis navigateur / Hoppscotch)
+# --- CORS (tests depuis navigateur / Hoppscotch/Postman) ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # tu peux restreindre à une URL précise si tu veux
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -21,7 +21,7 @@ MODEL_NAME = "gemini-1.5-flash"
 # --- Guide "experts" + règles par style (FR OBLIGATOIRE) + VISUEL + CTA ---
 STRUCTURE_GUIDE = r"""
 Tu es un comité de 6 experts (neurosciences, scénariste TikTok, growth, montage, analyste data, éthique).
-TA RÉPONSE DOIT ÊTRE EXCLUSIVEMENT EN **FRANÇAIS** et en **JSON VALIDE** (UTF-8), sans texte autour.
+TA RÉPONSE DOIT ÊTRE EXCLUSIVEMENT EN FRANÇAIS et en JSON VALIDE (UTF-8), sans texte autour.
 
 Schéma JSON attendu :
 {
@@ -55,7 +55,7 @@ RÈGLES COMMUNES :
 - Chaque 'point' contient un 'example' réel/plausible et un 'broll' concret.
 - ≥ 1 'micro_action' réalisable en <10 s.
 - 'proof' cite 1 source courte si utile : Auteur/Revue/Année (ex: "Tversky & Kahneman, Science, 1974").
-- **CTA OBLIGATOIRE** : 'cta.text' doit demander explicitement un **like** ET de **s'abonner/suivre la chaîne**.
+- CTA OBLIGATOIRE : 'cta.text' demande explicitement un like ET de s'abonner/suivre la chaîne.
 - 'caption' ≤ 8 mots.
 - 'risk_flags' si promesse exagérée, source floue, vocabulaire médical excessif.
 - Si conseil santé : 'disclaimer' court ("Ne remplace pas un avis professionnel").
@@ -66,7 +66,7 @@ SPÉCIFICITÉS PAR STYLE :
 - docu : ton sérieux, visuels ciné (fond sombre, plans serrés), 'proof' OBLIGATOIRE, captions sobres.
 - viral : rythme rapide, ≥ 1 "pattern_interrupt" par beat, ≥ 1 "micro_action" < 10 s.
 - quiz :
-   - hook = QUESTION + 3 options **A/B/C** dans le même champ 'text',
+   - hook = QUESTION + 3 options A/B/C dans le même champ 'text',
    - point(5-15) = révélation de la bonne réponse,
    - point(15-30) = fun fact + mini explication,
    - proof facultatif,
@@ -128,7 +128,7 @@ def suggest_hashtags(topic: str, style: str):
         extra = ["#viral", "#shorts", "#tiktokfr", "#buzz"]
     elif style == "docu":
         extra = ["#documentaire", "#culture", "#connaissance", "#éducation"]
-    else:  # quiz
+    else:
         extra = ["#quiz", "#jeu", "#challenge", "#test"]
     topic_tag = "#" + re.sub(r"[^a-z0-9]", "", topic.lower())
     tags = base + extra + [topic_tag]
@@ -162,7 +162,7 @@ def normalize_sections(data, style: str, duration: int, topic_for_tags: str):
     secs.append(ensure_cta_like_follow(None)) if cta_idx is None else \
         secs.__setitem__(cta_idx, ensure_cta_like_follow(secs[cta_idx]))
 
-    # Ajustements style "quiz"
+    # Spécifique "quiz"
     if style == "quiz":
         for s in secs:
             if s.get("type") == "hook":
@@ -190,7 +190,6 @@ def normalize_sections(data, style: str, duration: int, topic_for_tags: str):
     data.setdefault("risk_flags", [])
     data.setdefault("metrics_hypothesis", ["hook fort", "micro-action <10s", "question commentable"])
     data.setdefault("reuse_assets", True)
-
     return data
 
 # ----------------- ROUTES -----------------
@@ -250,7 +249,7 @@ RENVOIE UNIQUEMENT LE JSON.
         "style": style,
         "duration_sec": data["duration_sec"],
         "script": data,
-        "raw": raw  # utile pour debug si besoin
+        "raw": raw  # utile pour debug
     }
 
 @app.post("/lint")
@@ -278,93 +277,45 @@ async def lint(request: Request):
         if cap and len(cap.split()) > 8:
             issues.append(f"Caption trop longue: '{cap}'")
 
-    # visual_style complet
+    # visual_style complet ?
     if "visual_style" not in script or not isinstance(script.get("visual_style"), dict):
         issues.append("visual_style manquant : luminosity/contrast/palette/transitions/effects/overall_style.")
 
-    # hashtags présents
+    # hashtags présents ?
     if "hashtags" not in script or not script.get("hashtags"):
         issues.append("hashtags manquants.")
 
     fixed = normalize_sections(script, style, duration, topic_for_tags=script.get("title","topic"))
     return {"issues": list(set(issues)), "fixed_script": fixed}
 
-# ----------------- /improve : amélioration d'un script existant -----------------
-def make_improvement_prompt(script_json: str) -> str:
-    return f"""
-Tu es un comité de 6 experts (neurosciences, scénariste TikTok, growth, montage, analyste data, éthique).
-Améliore le script JSON ci-dessous SANS changer le sens, mais en :
-- renforçant le HOOK (≤ 12 mots, <8s, curiosité + enjeu perso),
-- ajoutant des PATTERN INTERRUPT discrets et pertinents,
-- rendant chaque POINT concret (exemple réel/plausible + b-roll précis),
-- imposant au moins UNE MICRO-ACTION < 10s,
-- clarifiant/serrant la PROOF (Auteur/Revue/Année) si possible,
-- forçant le CTA à demander clairement like + abonnement en FR,
-- gardant des CAPTIONS ≤ 8 mots, FR naturel,
-- complétant le VISUAL_STYLE (luminosité, contraste, palette, transitions, effets, style),
-- proposant 6–8 HASHTAGS pertinents (FR/EN + tag sujet concaténé),
-- respectant la DURÉE cible (timecodes couvrant la durée).
-RENVOIE UNIQUEMENT DU JSON VALIDE (UTF-8) AVEC LA MÊME STRUCTURE.
-Script à améliorer :
-{script_json}
-"""
-
 @app.post("/improve")
 async def improve(request: Request):
     """
-    Input:
-      {
-        "script": { ... JSON du script existant ... },
-        "duration_sec": (optionnel),
-        "style": (optionnel),
-        "topic": (optionnel, pour hashtags si title manquant)
-      }
-    Output:
-      - improved (par Gemini)
-      - normalized (garanti par nos règles locales)
-      - issues (lint rapide)
-      - raw_model_output (debug)
+    Améliore un script existant avec le comité d'experts.
+    Retourne une version optimisée (CTA/captions/micro-actions/style/hashtags).
     """
-    payload = await request.json()
-    original = payload.get("script", {})
-    if not original:
-        return {"error": "Champ 'script' manquant. Envoie { \"script\": { ... } }."}
+    body = await request.json()
+    script = body.get("script")
 
-    style = payload.get("style", original.get("style", "viral"))
-    duration = int(payload.get("duration_sec", original.get("duration_sec", 45)))
-    topic_for_tags = payload.get("topic", original.get("title", "psychologie"))
+    if not script:
+        return {"error": "Aucun script fourni. Envoie { \"script\": { ...ton JSON... } }"}
 
-    raw_in = json.dumps(original, ensure_ascii=False, indent=2)
-    prompt = make_improvement_prompt(raw_in)
-    model = genai.GenerativeModel(MODEL_NAME)
-    resp = model.generate_content(prompt)
-    raw_out = getattr(resp, "text", str(resp)).strip()
+    style = script.get("style", "viral")
+    duration = int(script.get("duration_sec", 45))
 
+    prompt = f"""{STRUCTURE_GUIDE}
+
+Améliore ce script déjà généré pour le rendre plus percutant, clair et engageant,
+en respectant STRICTEMENT le schéma JSON attendu :
+{json.dumps(script, ensure_ascii=False, indent=2)}
+
+RENVOIE UNIQUEMENT LE JSON.
+"""
+    raw = ask_gemini(prompt)
     try:
-        improved = force_json(raw_out)
+        data = force_json(raw)
     except Exception:
-        improved = original  # si Gemini échoue à renvoyer du JSON propre, on garde l'original
+        data = script  # fallback
 
-    improved.setdefault("style", style)
-    improved.setdefault("duration_sec", duration)
-    normalized = normalize_sections(improved, improved.get("style", style), int(improved.get("duration_sec", duration)), topic_for_tags)
-
-    issues = []
-    cta = next((s for s in normalized.get("sections", []) if s.get("type")=="cta"), None)
-    if not cta or "like" not in cta.get("text","").lower() or not any(k in cta.get("text","").lower() for k in ["abonne","suis","suivre"]):
-        issues.append("CTA incomplet (like + abonnement requis).")
-    for s in normalized.get("sections", []):
-        cap = s.get("caption","")
-        if cap and len(cap.split()) > 8:
-            issues.append(f"Caption trop longue: '{cap}'")
-    if "visual_style" not in normalized or not isinstance(normalized.get("visual_style"), dict):
-        issues.append("visual_style manquant ou incomplet.")
-    if "hashtags" not in normalized or not normalized.get("hashtags"):
-        issues.append("hashtags manquants.")
-
-    return {
-        "improved": improved,
-        "normalized": normalized,
-        "issues": list(set(issues)),
-        "raw_model_output": raw_out
-    }
+    data = normalize_sections(data, style, duration, topic_for_tags=script.get("title","topic"))
+    return {"improved_script": data, "raw": raw}
