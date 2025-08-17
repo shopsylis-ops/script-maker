@@ -18,7 +18,7 @@ app.add_middleware(
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 MODEL_NAME = "gemini-1.5-flash"
 
-# --- Guide "experts" + règles par style (FR OBLIGATOIRE) + VISUEL ---
+# --- Guide "experts" + règles par style (FR OBLIGATOIRE) + VISUEL + CTA ---
 STRUCTURE_GUIDE = r"""
 Tu es un comité de 6 experts (neurosciences, scénariste TikTok, growth, montage, analyste data, éthique).
 TA RÉPONSE DOIT ÊTRE EXCLUSIVEMENT EN **FRANÇAIS** et en **JSON VALIDE** (UTF-8), sans texte autour.
@@ -75,6 +75,7 @@ SPÉCIFICITÉS PAR STYLE :
 NE JAMAIS SORTIR DU FORMAT JSON.
 """
 
+# ----------------- Utils Gemini & JSON -----------------
 def ask_gemini(prompt: str) -> str:
     model = genai.GenerativeModel(MODEL_NAME)
     resp = model.generate_content(prompt)
@@ -90,6 +91,7 @@ def force_json(txt: str):
             return json.loads(txt[start:end+1])
         raise
 
+# ----------------- Normalisation / garanties -----------------
 def ensure_cta_like_follow(section):
     """Corrige le CTA pour exiger 'like' et 'abonne/suis' en FR."""
     if not section or section.get("type") != "cta":
@@ -114,31 +116,54 @@ def default_visual_style(style: str):
         return {"luminosity":"clair","contrast":"moyen","color_palette":"saturées",
                 "transitions":["cut sec","zoom rapide"],"effects":["texte animé","glitch léger"],
                 "overall_style":"pop colorée"}
+    # quiz
     return {"luminosity":"neutre","contrast":"moyen","color_palette":"neutres",
             "transitions":["cut sec","pop-in réponses"],"effects":["texte animé","split screen"],
-            "overall_style":"sobre éducatif"}  # quiz
+            "overall_style":"sobre éducatif"}
 
-def normalize_sections(data, style: str, duration: int):
-    """Assure sections minimales, CTA FR, visual_style et durée bornée."""
+def suggest_hashtags(topic: str, style: str):
+    """Hashtags FR/EN pertinents TikTok/Shorts/Reels (max ~8)."""
+    base = ["#psychologie", "#cerveau", "#science", "#neurosciences", "#apprendre", "#fyp", "#pourtoi"]
+    if style == "viral":
+        extra = ["#viral", "#shorts", "#tiktokfr", "#buzz"]
+    elif style == "docu":
+        extra = ["#documentaire", "#culture", "#connaissance", "#éducation"]
+    else:  # quiz
+        extra = ["#quiz", "#jeu", "#challenge", "#test"]
+    topic_tag = "#" + re.sub(r"[^a-z0-9]", "", topic.lower())
+    tags = base + extra + [topic_tag]
+    # dédoublonner en gardant l'ordre
+    seen, out = set(), []
+    for t in tags:
+        if t not in seen and t:
+            out.append(t); seen.add(t)
+    return out[:8]
+
+def normalize_sections(data, style: str, duration: int, topic_for_tags: str):
+    """Assure sections minimales, CTA FR, visual_style, durée bornée, hashtags."""
     secs = data.get("sections", [])
     types = [s.get("type") for s in secs]
 
+    # Hook
     if "hook" not in types:
         secs.insert(0, {"type":"hook","time":"0-5","text":"Ton cerveau te joue des tours.",
                         "caption":"Ton cerveau te trompe","broll":"plan serré visage",
                         "pattern_interrupt":"cut rapide"})
+    # Minimum 2 points
     if types.count("point") < 2:
         secs.append({"type":"point","time":"5-15","text":"Exemple simple et concret.",
                      "caption":"Tu l’as vécu ?","broll":"texte animé","example":"situation quotidienne"})
         secs.append({"type":"point","time":"15-30","text":"Mini action à tester maintenant.",
                      "caption":"Teste-le","broll":"mains + téléphone","micro_action":"essaie pendant 10s"})
+    # Proof
     if "proof" not in types:
         secs.append({"type":"proof","time":"30-40","text":"Observation étayée.","source":"—"})
-
+    # CTA
     cta_idx = next((i for i,s in enumerate(secs) if s.get("type")=="cta"), None)
     secs.append(ensure_cta_like_follow(None)) if cta_idx is None else \
         secs.__setitem__(cta_idx, ensure_cta_like_follow(secs[cta_idx]))
 
+    # Ajustements style "quiz"
     if style == "quiz":
         for s in secs:
             if s.get("type") == "hook":
@@ -149,14 +174,27 @@ def normalize_sections(data, style: str, duration: int):
         secs[-1]["caption"] = "Like + Abonne-toi"
 
     data["sections"] = secs
+
+    # Visual style
     if "visual_style" not in data or not isinstance(data.get("visual_style"), dict):
         data["visual_style"] = default_visual_style(style)
 
     # Durée bornée 30–60
     data["duration_sec"] = max(30, min(int(data.get("duration_sec", duration)), 60))
+
+    # Hashtags
+    title_or_topic = data.get("title") or topic_for_tags
+    data["hashtags"] = suggest_hashtags(title_or_topic, style)
+
+    # Champs complémentaires par défaut
+    data.setdefault("disclaimer", "Contenu éducatif. Ne remplace pas un avis professionnel.")
+    data.setdefault("risk_flags", [])
+    data.setdefault("metrics_hypothesis", ["hook fort", "micro-action <10s", "question commentable"])
+    data.setdefault("reuse_assets", True)
+
     return data
 
-# ---------- ROUTES ----------
+# ----------------- ROUTES -----------------
 @app.get("/")
 def home():
     return {"message": "Script-maker service is running!"}
@@ -182,10 +220,12 @@ RENVOIE UNIQUEMENT LE JSON.
 """
     raw = ask_gemini(prompt)
 
+    # Parsing + normalisation
     try:
         data = force_json(raw)
     except Exception:
-        data = {  # Fallback minimal
+        # Fallback minimal si JSON invalide
+        data = {
             "title": f"{topic} ({duration}s)", "style": style, "duration_sec": duration,
             "sections": [
                 {"type":"hook","time":"0-5","text":f"Et si {topic} te trompait ?",
@@ -199,18 +239,20 @@ RENVOIE UNIQUEMENT LE JSON.
                  "caption":"Like + Abonne-toi"}
             ],
             "visual_style": default_visual_style(style),
-            "disclaimer":"Ne remplace pas un avis professionnel",
-            "risk_flags":[], "metrics_hypothesis":["défi 10s","question commentable"],
-            "reuse_assets": True
         }
 
     data.setdefault("title", f"{topic} ({duration}s)")
     data["style"] = style
     data["duration_sec"] = duration
-    data = normalize_sections(data, style, duration)
+    data = normalize_sections(data, style, duration, topic_for_tags=topic)
 
-    return {"topic": topic, "style": style, "duration_sec": data["duration_sec"],
-            "script": data, "raw": raw}
+    return {
+        "topic": topic,
+        "style": style,
+        "duration_sec": data["duration_sec"],
+        "script": data,
+        "raw": raw  # utile pour debug si besoin
+    }
 
 @app.post("/lint")
 async def lint(request: Request):
@@ -238,8 +280,12 @@ async def lint(request: Request):
             issues.append(f"Caption trop longue: '{cap}'")
 
     # visual_style complet
-    if "visual_style" not in script:
+    if "visual_style" not in script or not isinstance(script.get("visual_style"), dict):
         issues.append("visual_style manquant : luminosity/contrast/palette/transitions/effects/overall_style.")
 
-    fixed = normalize_sections(script, style, duration)
+    # hashtags présents
+    if "hashtags" not in script or not script.get("hashtags"):
+        issues.append("hashtags manquants.")
+
+    fixed = normalize_sections(script, style, duration, topic_for_tags=script.get("title","topic"))
     return {"issues": list(set(issues)), "fixed_script": fixed}
