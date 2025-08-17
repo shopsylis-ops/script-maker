@@ -132,7 +132,6 @@ def suggest_hashtags(topic: str, style: str):
         extra = ["#quiz", "#jeu", "#challenge", "#test"]
     topic_tag = "#" + re.sub(r"[^a-z0-9]", "", topic.lower())
     tags = base + extra + [topic_tag]
-    # dédoublonner en gardant l'ordre
     seen, out = set(), []
     for t in tags:
         if t not in seen and t:
@@ -289,3 +288,83 @@ async def lint(request: Request):
 
     fixed = normalize_sections(script, style, duration, topic_for_tags=script.get("title","topic"))
     return {"issues": list(set(issues)), "fixed_script": fixed}
+
+# ----------------- /improve : amélioration d'un script existant -----------------
+def make_improvement_prompt(script_json: str) -> str:
+    return f"""
+Tu es un comité de 6 experts (neurosciences, scénariste TikTok, growth, montage, analyste data, éthique).
+Améliore le script JSON ci-dessous SANS changer le sens, mais en :
+- renforçant le HOOK (≤ 12 mots, <8s, curiosité + enjeu perso),
+- ajoutant des PATTERN INTERRUPT discrets et pertinents,
+- rendant chaque POINT concret (exemple réel/plausible + b-roll précis),
+- imposant au moins UNE MICRO-ACTION < 10s,
+- clarifiant/serrant la PROOF (Auteur/Revue/Année) si possible,
+- forçant le CTA à demander clairement like + abonnement en FR,
+- gardant des CAPTIONS ≤ 8 mots, FR naturel,
+- complétant le VISUAL_STYLE (luminosité, contraste, palette, transitions, effets, style),
+- proposant 6–8 HASHTAGS pertinents (FR/EN + tag sujet concaténé),
+- respectant la DURÉE cible (timecodes couvrant la durée).
+RENVOIE UNIQUEMENT DU JSON VALIDE (UTF-8) AVEC LA MÊME STRUCTURE.
+Script à améliorer :
+{script_json}
+"""
+
+@app.post("/improve")
+async def improve(request: Request):
+    """
+    Input:
+      {
+        "script": { ... JSON du script existant ... },
+        "duration_sec": (optionnel),
+        "style": (optionnel),
+        "topic": (optionnel, pour hashtags si title manquant)
+      }
+    Output:
+      - improved (par Gemini)
+      - normalized (garanti par nos règles locales)
+      - issues (lint rapide)
+      - raw_model_output (debug)
+    """
+    payload = await request.json()
+    original = payload.get("script", {})
+    if not original:
+        return {"error": "Champ 'script' manquant. Envoie { \"script\": { ... } }."}
+
+    style = payload.get("style", original.get("style", "viral"))
+    duration = int(payload.get("duration_sec", original.get("duration_sec", 45)))
+    topic_for_tags = payload.get("topic", original.get("title", "psychologie"))
+
+    raw_in = json.dumps(original, ensure_ascii=False, indent=2)
+    prompt = make_improvement_prompt(raw_in)
+    model = genai.GenerativeModel(MODEL_NAME)
+    resp = model.generate_content(prompt)
+    raw_out = getattr(resp, "text", str(resp)).strip()
+
+    try:
+        improved = force_json(raw_out)
+    except Exception:
+        improved = original  # si Gemini échoue à renvoyer du JSON propre, on garde l'original
+
+    improved.setdefault("style", style)
+    improved.setdefault("duration_sec", duration)
+    normalized = normalize_sections(improved, improved.get("style", style), int(improved.get("duration_sec", duration)), topic_for_tags)
+
+    issues = []
+    cta = next((s for s in normalized.get("sections", []) if s.get("type")=="cta"), None)
+    if not cta or "like" not in cta.get("text","").lower() or not any(k in cta.get("text","").lower() for k in ["abonne","suis","suivre"]):
+        issues.append("CTA incomplet (like + abonnement requis).")
+    for s in normalized.get("sections", []):
+        cap = s.get("caption","")
+        if cap and len(cap.split()) > 8:
+            issues.append(f"Caption trop longue: '{cap}'")
+    if "visual_style" not in normalized or not isinstance(normalized.get("visual_style"), dict):
+        issues.append("visual_style manquant ou incomplet.")
+    if "hashtags" not in normalized or not normalized.get("hashtags"):
+        issues.append("hashtags manquants.")
+
+    return {
+        "improved": improved,
+        "normalized": normalized,
+        "issues": list(set(issues)),
+        "raw_model_output": raw_out
+    }
